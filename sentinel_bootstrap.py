@@ -168,6 +168,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except Exception as e:
+        print("ERROR:", e)
         print("Sentinel bootstrap failed; sensitive command output suppressed. Resume provisioning after checking runtime configuration.", file=sys.stderr)
         raise SystemExit(1)
