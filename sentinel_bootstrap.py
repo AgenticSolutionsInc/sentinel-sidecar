@@ -104,7 +104,7 @@ def verify(config, home, root):
     print("[sentinel-bootstrap] Running the policy evaluation dry run", flush=True)
     command(["python3", str(root / "sentinel_policy_eval.py"), "--dry-run"], env=env)
     print("[sentinel-bootstrap] Creating or updating the scheduled policy automations", flush=True)
-    jobs_response = json.loads(command(["openclaw", "automations", "list", "--all", "--json"], env=env))
+    jobs_response = json.loads(command(["openclaw", "cron", "list", "--all", "--json"], env=env))
     jobs = jobs_response if isinstance(jobs_response, list) else jobs_response.get("jobs", [])
     for suffix, schedule, timeout in (("sync", config["syncSchedule"], 180), ("eval", config["evalSchedule"], 3600)):
         name = "sentinel-policy-" + suffix + "-" + env["OPENCLAW_AGENT_ID"]
@@ -118,11 +118,11 @@ def verify(config, home, root):
         if matches:
             if matches[0].get("description") != "sentinel-provisioner-v1":
                 raise RuntimeError("Automation name belongs to an unmanaged job.")
-            command(["openclaw", "automations", "edit", matches[0]["id"], "--enable", *common], env=env)
+            command(["openclaw", "cron", "edit", matches[0]["id"], "--enable", *common], env=env)
         else:
-            command(["openclaw", "automations", "add", "--name", name, "--description", "sentinel-provisioner-v1",
+            command(["openclaw", "cron", "add", "--name", name, "--description", "sentinel-provisioner-v1",
                      "--agent", env["OPENCLAW_AGENT_ID"], "--no-deliver", *common], env=env)
-    response = json.loads(command(["openclaw", "automations", "list", "--all", "--json"], env=env))
+    response = json.loads(command(["openclaw", "cron", "list", "--all", "--json"], env=env))
     checked = response if isinstance(response, list) else response.get("jobs", [])
     for suffix in ("sync", "eval"):
         name = "sentinel-policy-" + suffix + "-" + env["OPENCLAW_AGENT_ID"]
