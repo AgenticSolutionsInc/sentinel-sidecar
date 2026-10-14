@@ -43,18 +43,17 @@ def install(config, desired, home, root):
     env_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     original = env_path.read_text() if env_path.exists() else ""
     existing = environment(env_path) if env_path.exists() else {}
+    owned_settings = ("POLICY_SYNC_STATE_PATH", "OPENCLAW_CONTROL_UI_ALLOWED_ORIGIN")
     # Keep existing credentials/configuration; secret rotation is a separate operation.
     for key, value in desired.items():
-        if key in existing and existing[key] != value and key != "POLICY_SYNC_STATE_PATH":
+        if key in existing and existing[key] != value and key not in owned_settings:
             raise RuntimeError(f"Existing environment value differs for {key}; resolve explicitly before provisioning.")
     missing = {key: value for key, value in desired.items()
-               if key not in existing or (key == "POLICY_SYNC_STATE_PATH" and existing[key] != value)}
-    # Hyper injects OPENCLAW_GATEWAY_TOKEN into the process environment. That
-    # does not mean the token is persisted in OpenClaw's own .env file.
-    if desired.get("OPENCLAW_GATEWAY_TOKEN") and not re.search(
-        r"(?m)^\s*(?:export\s+)?OPENCLAW_GATEWAY_TOKEN\s*=", original
-    ):
-        missing["OPENCLAW_GATEWAY_TOKEN"] = desired["OPENCLAW_GATEWAY_TOKEN"]
+               if key not in existing or (key in owned_settings and existing[key] != value)}
+    # Persist these values even when Hyper already injects them into the process.
+    for key in ("OPENCLAW_GATEWAY_TOKEN", "OPENCLAW_CONTROL_UI_ALLOWED_ORIGIN"):
+        if desired.get(key) and not re.search(r"(?m)^\s*(?:export\s+)?" + key + r"\s*=", original):
+            missing[key] = desired[key]
     if missing:
         addition = "\n# Sentinel provisioning\n" + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in missing.items())
         atomic(env_path, original + addition)
