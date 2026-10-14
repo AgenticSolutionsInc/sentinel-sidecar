@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provisioner-owned bootstrap; uploaded to a private runtime staging directory."""
+"""Provisioner-owned bootstrap; checked out in a private runtime staging directory."""
 import fcntl
 import hashlib
 import json
@@ -39,7 +39,7 @@ def environment(path):
 
 
 def install(config, desired, home, root):
-    print("[sentinel-bootstrap] Verifying uploaded bundle checksums", flush=True)
+    print("[sentinel-bootstrap] Verifying Git checkout bundle checksums", flush=True)
     for name, expected in config["hashes"].items():
         if hashlib.sha256((STAGE / name).read_bytes()).hexdigest() != expected:
             raise RuntimeError("Sentinel bundle checksum mismatch.")
