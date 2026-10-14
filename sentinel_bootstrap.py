@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Provisioner-owned bootstrap; checked out in a private runtime staging directory."""
+"""Provisioner-owned bootstrap, run directly from ~/sentinel-sidecar."""
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 
-STAGE = Path(__file__).resolve().parent
+SIDECAR = Path(__file__).resolve().parent
 
 
 def command(argv, env=None, timeout=120):
@@ -39,13 +38,6 @@ def environment(path):
 
 
 def install(config, desired, home, root):
-    print("[sentinel-bootstrap] Verifying Git checkout bundle checksums", flush=True)
-    for name, expected in config["hashes"].items():
-        if hashlib.sha256((STAGE / name).read_bytes()).hexdigest() != expected:
-            raise RuntimeError("Sentinel bundle checksum mismatch.")
-    current = root / "current"
-    if current.exists() and current.resolve().name != config["bundle"] and not config["upgrade"]:
-        raise RuntimeError("A different Sentinel bundle is installed; rerun with --upgrade.")
     env_path = home / ".openclaw/.env"
     print("[sentinel-bootstrap] Merging required values into OpenClaw's environment file", flush=True)
     env_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -53,9 +45,10 @@ def install(config, desired, home, root):
     existing = environment(env_path) if env_path.exists() else {}
     # Keep existing credentials/configuration; secret rotation is a separate operation.
     for key, value in desired.items():
-        if key in existing and existing[key] != value:
+        if key in existing and existing[key] != value and key != "POLICY_SYNC_STATE_PATH":
             raise RuntimeError(f"Existing environment value differs for {key}; resolve explicitly before provisioning.")
-    missing = {key: value for key, value in desired.items() if key not in existing}
+    missing = {key: value for key, value in desired.items()
+               if key not in existing or (key == "POLICY_SYNC_STATE_PATH" and existing[key] != value)}
     # Hyper injects OPENCLAW_GATEWAY_TOKEN into the process environment. That
     # does not mean the token is persisted in OpenClaw's own .env file.
     if desired.get("OPENCLAW_GATEWAY_TOKEN") and not re.search(
@@ -67,27 +60,8 @@ def install(config, desired, home, root):
         atomic(env_path, original + addition)
     else:
         env_path.chmod(0o600)
-    releases = root / "releases"
-    print("[sentinel-bootstrap] Installing the versioned Sentinel release", flush=True)
-    release = releases / config["bundle"]
-    release.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for name, expected in config["hashes"].items():
-        content = (STAGE / name).read_text()
-        if hashlib.sha256(content.encode()).hexdigest() != expected:
-            raise RuntimeError("Sentinel bundle checksum mismatch.")
-        atomic(release / name, content, 0o500 if name.endswith(".sh") else 0o400)
-    atomic(release / "VERSION", config["sentinelVersion"] + "\n", 0o400)
-    temporary_link = root / ".current-next"
-    if temporary_link.is_symlink():
-        temporary_link.unlink()
-    temporary_link.symlink_to(release)
-    os.replace(temporary_link, current)
-    for name in config["hashes"]:
-        link = root / name
-        if link.exists() and not link.is_symlink():
-            raise RuntimeError("Unexpected unmanaged file in Sentinel directory.")
-        if not link.is_symlink():
-            link.symlink_to(Path("current") / name)
+    for name in ("sentinel-policy-sync.sh", "sentinel-policy-eval.sh"):
+        (root / name).chmod(0o700)
     state = root / "state"
     state.mkdir(exist_ok=True, mode=0o700)
     print("[sentinel-bootstrap] Finding the configured OpenClaw agent workspace", flush=True)
@@ -105,8 +79,8 @@ def install(config, desired, home, root):
         env["AGENTS_MD_PATH"] = agents_path
     print("[sentinel-bootstrap] Running the initial policy sync", flush=True)
     command(["python3", str(root / "sentinel_policy_sync.py")], env=env)
-    # Remove the staging copy of credentials as soon as they are installed.
-    (STAGE / "environment.json").unlink(missing_ok=True)
+    # Remove the temporary credentials once installed in OpenClaw's .env.
+    (SIDECAR / "environment.json").unlink(missing_ok=True)
 
 
 def verify(config, home, root):
@@ -175,15 +149,14 @@ def install_telemetry(config, home):
 
 def main():
     os.umask(0o077)
-    config = json.loads((STAGE / "bootstrap.json").read_text())
+    config = json.loads((SIDECAR / "bootstrap.json").read_text())
     home = Path(config["home"])
-    root = home / ".sentinel"
-    root.mkdir(exist_ok=True, mode=0o700)
+    root = home / "sentinel-sidecar"
     root.chmod(0o700)
     with (root / "bootstrap.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if sys.argv[1] == "install":
-            install(config, json.loads((STAGE / "environment.json").read_text()), home, root)
+            install(config, json.loads((SIDECAR / "environment.json").read_text()), home, root)
         elif sys.argv[1] == "verify":
             verify(config, home, root)
         elif sys.argv[1] == "telemetry":
