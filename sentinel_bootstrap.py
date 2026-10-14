@@ -76,8 +76,6 @@ def install(config, desired, home, root):
     if not env.get("AGENTS_MD_PATH"):
         atomic(env_path, env_path.read_text() + "export AGENTS_MD_PATH=" + shlex.quote(agents_path) + "\n")
         env["AGENTS_MD_PATH"] = agents_path
-    print("[sentinel-bootstrap] Running the initial policy sync", flush=True)
-    command(["python3", str(root / "sentinel_policy_sync.py")], env=env)
     # Remove the temporary credentials once installed in OpenClaw's .env.
     (SIDECAR / "environment.json").unlink(missing_ok=True)
 
@@ -100,8 +98,6 @@ def verify(config, home, root):
                                 "--timeout", "60", "--json"], env=env, timeout=90))
     if not result or result.get("status") in ("error", "in_flight"):
         raise RuntimeError("Model connectivity check did not complete successfully.")
-    print("[sentinel-bootstrap] Running the policy evaluation dry run", flush=True)
-    command(["python3", str(root / "sentinel_policy_eval.py"), "--dry-run"], env=env)
     print("[sentinel-bootstrap] Creating or updating the scheduled policy automations", flush=True)
     jobs_response = json.loads(command(["openclaw", "cron", "list", "--all", "--json"], env=env))
     jobs = jobs_response if isinstance(jobs_response, list) else jobs_response.get("jobs", [])
@@ -127,6 +123,17 @@ def verify(config, home, root):
         name = "sentinel-policy-" + suffix + "-" + env["OPENCLAW_AGENT_ID"]
         if sum(job.get("name") == name and job.get("enabled", True) for job in checked) != 1:
             raise RuntimeError("Sentinel automation verification failed.")
+    # The connectivity turn above lets OpenClaw populate its workspace before
+    # Sentinel patches AGENTS.md. Never seed a blank file during provisioning.
+    agents_path = Path(env["AGENTS_MD_PATH"]).expanduser()
+    if not agents_path.is_file() or not agents_path.read_text(encoding="utf-8").strip():
+        raise RuntimeError("OpenClaw has not populated AGENTS.md; retry provisioning after workspace initialization.")
+    print("[sentinel-bootstrap] Running the initial policy sync after workspace initialization", flush=True)
+    # The normal runner also restarts the gateway when the policy set changes.
+    command(["bash", str(root / "sentinel-policy-sync.sh")], env=env)
+    # This read-only check needs the policy hash written by the initial sync.
+    print("[sentinel-bootstrap] Running the policy evaluation dry run", flush=True)
+    command(["python3", str(root / "sentinel_policy_eval.py"), "--dry-run"], env=env)
     print("Sentinel installation, evaluation dry run, and automations verified.")
 
 
