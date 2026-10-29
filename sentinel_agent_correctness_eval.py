@@ -72,13 +72,21 @@ def run_case(item, agent, binary, session, timeout):
     if out.returncode: return {'passed':False,'runnerError':'OpenClaw exited unsuccessfully: '+clean(out.stderr or out.stdout),'answer':''}
     try: payload=json.loads(out.stdout)
     except json.JSONDecodeError: return {'passed':False,'runnerError':'OpenClaw returned invalid JSON.','answer':clean(out.stdout)}
-    # CLI response formats vary by OpenClaw version; require a recognizable text field.
-    answer=''
-    for key in ('response','text','output','message','content','reply'):
-        value=payload.get(key) if isinstance(payload,dict) else None
-        if isinstance(value,str) and value.strip(): answer=value.strip(); break
-        if isinstance(value,dict) and isinstance(value.get('text'),str): answer=value['text'].strip(); break
-    if not answer: return {'passed':False,'runnerError':'Could not extract answer text from OpenClaw JSON response.','answer':clean(payload)}
+    # Current OpenClaw CLI replies often wrap assistant text at
+    # result.payloads[].text; tolerate the older top-level response forms too.
+    def answer_text(value):
+        if isinstance(value,str): return value.strip()
+        if isinstance(value,list):
+            parts=[answer_text(entry) for entry in value]
+            return '\n'.join(part for part in parts if part)
+        if isinstance(value,dict):
+            for key in ('text','response','output','message','content','reply','result','payloads'):
+                if key in value:
+                    found=answer_text(value[key])
+                    if found: return found
+        return ''
+    answer=answer_text(payload)
+    if not answer: return {'passed':False,'runnerError':'Could not extract answer text from OpenClaw JSON response.','answer':''}
     norm=lambda s:' '.join(s.split()).casefold()
     passed=norm(expected) in norm(answer) if mode=='contains' else norm(expected)==norm(answer)
     return {'passed':passed,'answer':answer,'matchMode':mode}
