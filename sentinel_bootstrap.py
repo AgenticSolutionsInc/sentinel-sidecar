@@ -59,7 +59,7 @@ def install(config, desired, home, root):
         atomic(env_path, original + addition)
     else:
         env_path.chmod(0o600)
-    for name in ("sentinel-policy-sync.sh", "sentinel-policy-eval.sh"):
+    for name in ("sentinel-policy-sync.sh", "sentinel-policy-eval.sh", "sentinel-agent-correctness-eval.sh"):
         (root / name).chmod(0o700)
     state = root / "state"
     state.mkdir(exist_ok=True, mode=0o700)
@@ -101,12 +101,15 @@ def verify(config, home, root):
     print("[sentinel-bootstrap] Creating or updating the scheduled policy automations", flush=True)
     jobs_response = json.loads(command(["openclaw", "cron", "list", "--all", "--json"], env=env))
     jobs = jobs_response if isinstance(jobs_response, list) else jobs_response.get("jobs", [])
-    for suffix, schedule, timeout in (("sync", config["syncSchedule"], 180), ("eval", config["evalSchedule"], 3600)):
-        name = "sentinel-policy-" + suffix + "-" + env["OPENCLAW_AGENT_ID"]
+    schedules = (("policy-sync", config["syncSchedule"], 180, "sentinel-policy-sync.sh"),
+                 ("policy-eval", config["evalSchedule"], 3600, "sentinel-policy-eval.sh"),
+                 ("agent-correctness", "30 2 * * *", 3600, "sentinel-agent-correctness-eval.sh"))
+    for suffix, schedule, timeout, runner_name in schedules:
+        name = "sentinel-" + suffix + "-" + env["OPENCLAW_AGENT_ID"]
         matches = [job for job in jobs if job.get("name") == name]
         if len(matches) > 1:
             raise RuntimeError("Duplicate Sentinel automation names require manual reconciliation.")
-        runner = str(root / ("sentinel-policy-" + suffix + ".sh"))
+        runner = str(root / runner_name)
         argv = ["flock", "-n", str(root / "state/execution.lock"), "timeout", "-k", "30", str(timeout - 30), runner]
         common = ["--cron", schedule, "--tz", config["timezone"], "--command-argv", json.dumps(argv),
                   "--timeout-seconds", str(timeout), "--output-max-bytes", "16384"]
@@ -119,8 +122,8 @@ def verify(config, home, root):
                      "--agent", env["OPENCLAW_AGENT_ID"], "--no-deliver", *common], env=env)
     response = json.loads(command(["openclaw", "cron", "list", "--all", "--json"], env=env))
     checked = response if isinstance(response, list) else response.get("jobs", [])
-    for suffix in ("sync", "eval"):
-        name = "sentinel-policy-" + suffix + "-" + env["OPENCLAW_AGENT_ID"]
+    for suffix in ("policy-sync", "policy-eval", "agent-correctness"):
+        name = "sentinel-" + suffix + "-" + env["OPENCLAW_AGENT_ID"]
         if sum(job.get("name") == name and job.get("enabled", True) for job in checked) != 1:
             raise RuntimeError("Sentinel automation verification failed.")
     # The connectivity turn above lets OpenClaw populate its workspace before
@@ -134,7 +137,9 @@ def verify(config, home, root):
     # This read-only check needs the policy hash written by the initial sync.
     print("[sentinel-bootstrap] Running the policy evaluation dry run", flush=True)
     command(["python3", str(root / "sentinel_policy_eval.py"), "--dry-run"], env=env)
-    print("Sentinel installation, evaluation dry run, and automations verified.")
+    print("[sentinel-bootstrap] Running the agent correctness dataset dry run", flush=True)
+    command(["python3", str(root / "sentinel_agent_correctness_eval.py"), "--dry-run"], env=env)
+    print("Sentinel installation, evaluation dry runs, and automations verified.")
 
 
 def install_telemetry(config, home):
