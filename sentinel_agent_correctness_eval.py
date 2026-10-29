@@ -115,7 +115,7 @@ def main():
     if args.dry_run:
         print(json.dumps({'dataset':DATASET,'activeTestCount':len(cases),'suiteDate':suite,'tests':[{'id':i.get('id'),'question':mapping(i.get('input')).get('question'),'matchMode':mapping(i.get('metadata')).get('matchMode')} for i in cases]},indent=2)); return 0
     if not cases: log('no active cases; exiting successfully'); return 0
-    session=latest_session(args.agent_id,binary,timeout); experiment=f'swyft-agent-correctness-{agent_key}-{suite}'
+    session=latest_session(args.agent_id,binary,timeout); experiment=f'swyft-agent-correctness-{agent_key}-{suite}-{uuid.uuid4().hex[:10]}'
     summary={'total':len(cases),'passed':0,'failed':0,'deliveryErrors':0}; log(f'Running {len(cases)} case(s) through existing session {session}.')
     for item in cases:
         result=run_case(item,args.agent_id,binary,session,timeout); summary['passed' if result['passed'] else 'failed']+=1
