@@ -10,7 +10,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import time
 
 SIDECAR = Path(__file__).resolve().parent
 
@@ -87,87 +86,6 @@ def install(config, desired, home, root):
     (SIDECAR / "environment.json").unlink(missing_ok=True)
 
 
-
-def build_gateway_patch(config, current_config, langfuse_base_url=None):
-    """Build the runtime configuration patch; secrets stay in .env."""
-    telemetry_mode = config["telemetry"]
-    if telemetry_mode not in ("langfuse-bridge", "otel"):
-        raise ValueError("Unknown telemetry mode.")
-    plugin = "diagnostics-otel" if telemetry_mode == "otel" else "langfuse-bridge"
-    plugins = current_config.get("plugins", {})
-    allow = plugins.get("allow")
-    patch = {"cron": {"enabled": True}, "plugins": {"entries": {plugin: {"enabled": True}}}}
-    if config.get("model") and config["model"] != "HyperCLI default":
-        patch["agents"] = {"defaults": {"model": {"primary": config["model"]}}}
-    if allow is not None:
-        if not isinstance(allow, list) or not all(isinstance(item, str) for item in allow):
-            raise ValueError("Existing plugin allowlist is invalid.")
-        patch["plugins"]["allow"] = list(dict.fromkeys([*allow, plugin]))
-    elif telemetry_mode == "otel":
-        # Preserve implicit access to existing plugins when introducing an allowlist.
-        patch["plugins"]["allow"] = list(dict.fromkeys([*plugins.get("entries", {}), plugin]))
-    if telemetry_mode == "otel":
-        if not langfuse_base_url or not langfuse_base_url.startswith("https://"):
-            raise ValueError("OTEL requires an HTTPS Langfuse base URL.")
-        patch["diagnostics"] = {"enabled": True, "otel": {
-            "enabled": True,
-            "endpoint": langfuse_base_url.rstrip("/") + "/api/public/otel",
-            "protocol": "http/protobuf", "serviceName": "openclaw-gateway",
-            "headers": {"Authorization": "Basic ${LANGFUSE_OTLP_AUTH}",
-                        "x-langfuse-ingestion-version": "4"},
-            "traces": True, "metrics": False, "logs": False,
-            "sampleRate": 1.0, "captureContent": True,
-        }}
-        if "langfuse-bridge" in plugins.get("entries", {}) or "langfuse-bridge" in (allow or []):
-            patch["plugins"]["entries"]["langfuse-bridge"] = {"enabled": False}
-    return patch
-
-
-def merge_config(current, patch):
-    result = dict(current)
-    for key, value in patch.items():
-        if isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = merge_config(result[key], value)
-        else:
-            result[key] = value
-    return result
-
-
-def configure(config, home):
-    env = environment(home / ".openclaw/.env")
-    path = Path(env.get("OPENCLAW_CONFIG_PATH") or home / ".openclaw/openclaw.json").expanduser()
-    original = path.read_text()
-    try:
-        current = json.loads(original)
-    except ValueError:
-        raise RuntimeError("Gateway configuration must be a JSON object; no changes were written.") from None
-    if not isinstance(current, dict):
-        raise RuntimeError("Gateway configuration must be a JSON object; no changes were written.")
-    desired = merge_config(current, build_gateway_patch(config, current, env.get("LANGFUSE_BASE_URL")))
-    # Validate a private candidate before replacing the live file. Keep raw env
-    # substitutions and unrelated settings, including gateway auth and pairing.
-    if desired != current:
-        with tempfile.TemporaryDirectory(dir=path.parent, prefix=".sentinel-config-") as directory:
-            candidate = Path(directory) / "openclaw.json"
-            atomic(candidate, json.dumps(desired, indent=2) + "\n")
-            command(["openclaw", "config", "validate"], env=dict(env, OPENCLAW_CONFIG_PATH=str(candidate)))
-        if path.read_text() != original:
-            raise RuntimeError("Gateway configuration changed during setup; rerun provisioning.")
-        atomic(path.with_name(path.name + ".sentinel.bak"), original)
-        atomic(path, json.dumps(desired, indent=2) + "\n")
-    # OpenClaw watches the configuration and applies/restarts it itself. Avoid
-    # service-manager restart commands: Hyper's container has no native service.
-    if desired.get("gateway", {}).get("reload", {}).get("mode") == "off":
-        raise RuntimeError("Configuration saved, but gateway reload is off; restart the managed gateway and rerun provisioning.")
-    print("[sentinel-bootstrap] Configuration saved; waiting for OpenClaw automatic reload during verification", flush=True)
-
-
-def verify_scheduler(env):
-    response = json.loads(command(["openclaw", "cron", "status", "--json"], env=env))
-    if response.get("enabled") is not True:
-        raise RuntimeError("OpenClaw cron scheduler is not enabled; provisioning remains incomplete.")
-
-
 def verify(config, home, root):
     plugin = telemetry_plugin(config)[0]
     print("[sentinel-bootstrap] Checking permissions and " + plugin, flush=True)
@@ -175,18 +93,10 @@ def verify(config, home, root):
     if env_path.stat().st_mode & 0o077 or root.stat().st_mode & 0o077:
         raise RuntimeError("Runtime secrets/directory permissions are too broad.")
     env = environment(env_path)
-    for attempt in range(20):
-        try:
-            verify_scheduler(env)
-            inventory = json.loads(command(["openclaw", "plugins", "list", "--json"], env=env))
-            plugins = inventory if isinstance(inventory, list) else inventory.get("plugins", [])
-            if not any(entry.get("id") == plugin and entry.get("status") == "loaded" for entry in plugins):
-                raise RuntimeError(plugin + " did not load after configuration; telemetry setup failed.")
-            break
-        except RuntimeError:
-            if attempt == 19:
-                raise
-            time.sleep(3)
+    inventory = json.loads(command(["openclaw", "plugins", "list", "--json"], env=env))
+    plugins = inventory if isinstance(inventory, list) else inventory.get("plugins", [])
+    if not any(entry.get("id") == plugin and entry.get("status") == "loaded" for entry in plugins):
+        raise RuntimeError(plugin + " did not load after gateway configuration; telemetry setup failed.")
     # Verify the model after the gateway patch, and establish the existing
     # session required by the current evaluator without modifying main chat.
     print("[sentinel-bootstrap] Checking model connectivity", flush=True)
@@ -275,8 +185,6 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if sys.argv[1] == "install":
             install(config, json.loads((SIDECAR / "environment.json").read_text()), home, root)
-        elif sys.argv[1] == "configure":
-            configure(config, home)
         elif sys.argv[1] == "verify":
             verify(config, home, root)
         elif sys.argv[1] == "telemetry":
