@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run Swyft Agent Correctness cases through the configured OpenClaw agent session."""
+"""Run Swyft Agent Correctness cases through disposable OpenClaw agent sessions."""
 from __future__ import annotations
 import argparse, base64, hashlib, json, os, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
+from sentinel_eval_session import run_isolated_case
 
 DATASET = 'swyft/agent-correctness'
 SOURCE = 'swyft-governance-agent-correctness-v1'
@@ -45,20 +46,6 @@ def fetch(api):
         if len(batch)<100: return ds,all_items
     raise RunnerError('Dataset exceeds 10,000 items.')
 
-def latest_session(agent, binary, timeout):
-    try: out=subprocess.run([binary,'sessions','--agent',agent,'--limit','all','--json'],capture_output=True,text=True,timeout=timeout,check=False)
-    except (OSError,subprocess.TimeoutExpired) as e: raise RunnerError(f'OpenClaw session lookup failed: {clean(e)}') from e
-    if out.returncode: raise RunnerError('OpenClaw session lookup failed: '+clean(out.stderr or out.stdout))
-    try: sessions=mapping(json.loads(out.stdout)).get('sessions',[])
-    except json.JSONDecodeError as e: raise RunnerError('OpenClaw sessions returned invalid JSON.') from e
-    sessions=[mapping(s) for s in sessions if mapping(s).get('key')]
-    if not sessions: raise RunnerError(f'No existing sessions found for {agent}.')
-    def stamp(s):
-        value=s.get('lastInteractionAt') or s.get('updatedAt') or ''
-        try: return datetime.fromisoformat(str(value).replace('Z','+00:00')).timestamp()
-        except ValueError: return 0
-    return str(max(sessions,key=stamp)['key'])
-
 def run_case(item, agent, binary, session, timeout):
     question=mapping(item.get('input')).get('question')
     expected=mapping(item.get('expectedOutput')).get('answer')
@@ -96,7 +83,7 @@ def attr_json(key,value): return attr(key,json.dumps(value,ensure_ascii=False,se
 def emit(api,ds,item,result,experiment_id,suite_date,agent_key):
     tid=os.urandom(16).hex(); sid=os.urandom(8).hex(); start=time.time_ns(); end=start+1
     meta={'swyftDatasetItemId':item.get('id'),'swyftAgentKey':agent_key,'swyftSuiteDate':suite_date,'swyftRunnerVersion':VERSION}
-    output={'answer':result.get('answer',''),'passed':result['passed'],'matchMode':result.get('matchMode'),'runnerError':result.get('runnerError')}
+    output={'answer':result.get('answer',''),'passed':result['passed'],'matchMode':result.get('matchMode'),'runnerError':result.get('runnerError'),'sessionKey':result.get('sessionKey'),'cleanupError':result.get('cleanupError')}
     attrs=[attr('langfuse.observation.type','agent'),attr('langfuse.trace.name','Swyft Agent Correctness Case'),attr('langfuse.environment','experiment'),attr('langfuse.experiment.id',experiment_id),attr('langfuse.experiment.name',EXPERIMENT),attr('langfuse.experiment.dataset.id',ds['id']),attr('langfuse.experiment.item.id',item['id']),attr('langfuse.experiment.item.root_observation_id',sid),attr_json('langfuse.experiment.item.expected_output',mapping(item.get('expectedOutput'))),attr_json('langfuse.observation.input',mapping(item.get('input'))),attr_json('langfuse.observation.output',output)]
     attrs += [attr('langfuse.experiment.metadata.'+k,v) for k,v in meta.items() if v is not None]
     attrs += [attr('langfuse.trace.metadata.'+k,v) for k,v in meta.items() if v is not None]
@@ -115,13 +102,15 @@ def main():
     if args.dry_run:
         print(json.dumps({'dataset':DATASET,'activeTestCount':len(cases),'suiteDate':suite,'tests':[{'id':i.get('id'),'question':mapping(i.get('input')).get('question'),'matchMode':mapping(i.get('metadata')).get('matchMode')} for i in cases]},indent=2)); return 0
     if not cases: log('no active cases; exiting successfully'); return 0
-    session=latest_session(args.agent_id,binary,timeout); experiment=f'swyft-agent-correctness-{agent_key}-{suite}-{uuid.uuid4().hex[:10]}'
-    summary={'total':len(cases),'passed':0,'failed':0,'deliveryErrors':0}; log(f'Running {len(cases)} case(s) through existing session {session}.')
+    experiment=f'swyft-agent-correctness-{agent_key}-{suite}-{uuid.uuid4().hex[:10]}'
+    summary={'total':len(cases),'passed':0,'failed':0,'deliveryErrors':0,'cleanupErrors':0}; log(f'Running {len(cases)} case(s) with a disposable session per case.')
     for item in cases:
-        result=run_case(item,args.agent_id,binary,session,timeout); summary['passed' if result['passed'] else 'failed']+=1
+        result=run_isolated_case(args.agent_id,binary,lambda key: run_case(item,args.agent_id,binary,key,timeout),'correctness')
+        summary['passed' if result['passed'] else 'failed']+=1
+        if result.get('cleanupError'): summary['cleanupErrors']+=1
         try: emit(api,ds,item,result,experiment,suite,agent_key)
         except Exception as e: summary['deliveryErrors']+=1; log(f'Langfuse delivery failed for item {item.get("id")}: {clean(e)}')
-    log(json.dumps(summary)); return 1 if summary['deliveryErrors'] else 0
+    log(json.dumps(summary)); return 1 if summary['deliveryErrors'] or summary['cleanupErrors'] else 0
 
 if __name__=='__main__':
     try: raise SystemExit(main())

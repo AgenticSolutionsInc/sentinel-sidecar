@@ -90,8 +90,7 @@ def verify(config, home, root):
     plugins = inventory if isinstance(inventory, list) else inventory.get("plugins", [])
     if not any(plugin.get("id") == "langfuse-bridge" and plugin.get("status") == "loaded" for plugin in plugins):
         raise RuntimeError("Langfuse bridge did not load after gateway configuration; telemetry setup failed.")
-    # Verify the model after the gateway patch, and establish the existing
-    # session required by the current evaluator without modifying main chat.
+    # Verify the model after the gateway patch without modifying main chat.
     print("[sentinel-bootstrap] Checking model connectivity", flush=True)
     result = json.loads(command(["openclaw", "agent", "--agent", env["OPENCLAW_AGENT_ID"], "--session-key", "sentinel-setup",
                                 "--message", "Internal connectivity check: respond OK only. Do not use tools or take external actions.",

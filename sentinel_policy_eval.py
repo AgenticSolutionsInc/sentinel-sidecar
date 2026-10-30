@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run Langfuse policy-conformance dataset items through the latest OpenClaw session.
+"""Run Langfuse policy-conformance dataset items through disposable OpenClaw sessions.
 
 This implementation has *no pip dependencies*. It uses only Python's standard
 library to:
 
 1. Read `swyft/policy-conformance` through the Langfuse public REST API.
-2. Run each active dataset item through the agent's latest existing OpenClaw session.
+2. Run each active dataset item through a fresh OpenClaw session, discarded after each case.
 3. Send one experiment-tagged OTLP/HTTP JSON root span per execution.
 4. Send a Boolean `swyft_policy_conformance` score through Langfuse's public
    Scores API.
@@ -52,6 +52,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
+
+from sentinel_eval_session import run_isolated_case
 
 
 DATASET_NAME = "swyft/policy-conformance"
@@ -304,69 +306,6 @@ def build_prompt(item: Mapping[str, Any]) -> str:
     )
 
 
-def timestamp_value(value: object) -> float:
-    if value is None:
-        return 0.0
-    if isinstance(value, (int, float)):
-        return value / 1000 if value > 10_000_000_000 else float(value)
-    if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return 0.0
-    return 0.0
-
-
-def get_latest_session_key(settings: Settings) -> str:
-    """Return the most recently active existing session for the configured agent."""
-    command = [
-        settings.openclaw_bin,
-        "sessions",
-        "--agent",
-        settings.agent_id,
-        "--limit",
-        "all",
-        "--json",
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=settings.timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise RunnerError("OpenClaw session lookup timed out.") from error
-    except OSError as error:
-        raise RunnerError(f"Could not start OpenClaw session lookup: {clean_text(error)}") from error
-
-    if completed.returncode != 0:
-        detail = clean_text(completed.stderr or completed.stdout or f"exit code {completed.returncode}")
-        raise RunnerError(f"OpenClaw session lookup failed: {detail}")
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
-        raise RunnerError("OpenClaw sessions --json returned invalid JSON.") from error
-
-    sessions = as_mapping(payload).get("sessions")
-    if not isinstance(sessions, list) or not sessions:
-        raise RunnerError(f"No existing sessions found for agent {settings.agent_id!r}.")
-    valid_sessions = [as_mapping(session) for session in sessions if as_mapping(session).get("key")]
-    if not valid_sessions:
-        raise RunnerError(f"No existing session with a key was found for agent {settings.agent_id!r}.")
-
-    latest = max(
-        valid_sessions,
-        key=lambda session: (
-            timestamp_value(session.get("lastInteractionAt")),
-            timestamp_value(session.get("updatedAt")),
-            timestamp_value(session.get("sessionStartedAt")),
-        ),
-    )
-    return str(latest["key"])
-
-
 def iter_text_candidates(value: object) -> Iterable[str]:
     if isinstance(value, str):
         yield value
@@ -438,9 +377,9 @@ def extract_agent_decision(cli_payload: object) -> dict[str, Any] | None:
     return None
 
 
-def run_openclaw_case(settings: Settings, item: Mapping[str, Any], latest_session_key: str) -> dict[str, Any]:
+def run_openclaw_case(settings: Settings, item: Mapping[str, Any], session_key: str) -> dict[str, Any]:
     prompt = build_prompt(item)
-    key = latest_session_key
+    key = session_key
     prompt_path: str | None = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", prefix="swyft-policy-eval-", encoding="utf-8", delete=False) as prompt_file:
@@ -544,7 +483,7 @@ def otel_span_payload(
         attr_string("langfuse.experiment.id", experiment_id),
         attr_string("langfuse.experiment.name", EXPERIMENT_NAME),
         attr_string("langfuse.experiment.dataset.id", dataset["id"]),
-        attr_string("langfuse.experiment.description", "Nightly OpenClaw policy-conformance experiment using the latest existing agent session."),
+        attr_string("langfuse.experiment.description", "Nightly OpenClaw policy-conformance experiment using a disposable session per case."),
         attr_string("langfuse.experiment.item.id", item["id"]),
         attr_string("langfuse.experiment.item.root_observation_id", span_id),
         attr_json("langfuse.experiment.item.expected_output", expected_output),
@@ -697,22 +636,26 @@ def main() -> int:
 
     run_nonce = uuid.uuid4().hex[:10]
     experiment_id = f"swyft-policy-conformance-{settings.agent_key}-{settings.suite_date}-{run_nonce}"
-    summary = {"total": len(items), "passed": 0, "failed": 0, "runnerErrors": 0, "deliveryErrors": 0}
-    latest_session_key = get_latest_session_key(settings)
+    summary = {"total": len(items), "passed": 0, "failed": 0, "runnerErrors": 0, "deliveryErrors": 0, "cleanupErrors": 0}
     log(f"starting {experiment_id} with {len(items)} active dataset item(s)")
-    log(f"using latest existing OpenClaw session: {latest_session_key}")
+    log("using a fresh disposable OpenClaw session for each case")
 
     for item in items:
         start_ns = time.time_ns()
         try:
-            output = run_openclaw_case(settings, item, latest_session_key)
+            output = run_isolated_case(
+                settings.agent_id, settings.openclaw_bin,
+                lambda key: run_openclaw_case(settings, item, key), "policy",
+            )
         except RunnerError as error:
             output = {"runnerError": clean_text(error), "decision": None}
         finish_ns = time.time_ns()
 
         expected = expected_decision(item)
         actual = output.get("decision")
-        passed = isinstance(actual, str) and actual == expected
+        passed = not output.get("runnerError") and isinstance(actual, str) and actual == expected
+        if output.get("cleanupError"):
+            summary["cleanupErrors"] += 1
         if output.get("runnerError"):
             summary["runnerErrors"] += 1
             comment = f"Runner error: {clean_text(output['runnerError'], 400)}"
@@ -756,7 +699,7 @@ def main() -> int:
         "suiteDate": settings.suite_date,
         **summary,
     }, indent=2))
-    return 1 if summary["deliveryErrors"] else 0
+    return 1 if summary["deliveryErrors"] or summary["cleanupErrors"] else 0
 
 
 if __name__ == "__main__":
