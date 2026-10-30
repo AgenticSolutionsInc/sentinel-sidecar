@@ -15,9 +15,9 @@ import time
 SIDECAR = Path(__file__).resolve().parent
 
 
-def command(argv, env=None, timeout=120, input_data=None):
+def command(argv, env=None, timeout=120):
     print("[sentinel-bootstrap] Command: " + shlex.join(str(part) for part in argv), flush=True)
-    result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout, input=input_data)
+    result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
     if result.returncode:
         raise RuntimeError("Runtime health/configuration command failed; output suppressed to protect credentials.")
     return result.stdout
@@ -239,27 +239,12 @@ def verify(config, home, root):
     print("Sentinel installation, evaluation dry runs, and automations verified.")
 
 
-BRIDGE_SQLITE_PACKAGE = "git:github.com/langfuse/openclaw-x-langfuse-plugin@fix/content-on-sqlite-sessions"
-
-
-def runtime_telemetry_config(config, version):
-    """Use the SQLite-compatible bridge on OpenClaw 2026.8 and later."""
-    match = re.search(r"(?<!\d)(\d{4})\.(\d{1,2})\.(\d{1,2})(?!\d)", version)
-    if not match:
-        raise RuntimeError("Cannot determine OpenClaw version for telemetry installation.")
-    result = dict(config)
-    if tuple(map(int, match.groups())) >= (2026, 8, 0):
-        result["telemetry"] = "langfuse-bridge"
-        result["bridgeInstallPackage"] = BRIDGE_SQLITE_PACKAGE
-    return result
-
-
 def telemetry_plugin(config):
     mode = config.get("telemetry", "langfuse-bridge")
     if mode == "otel":
         return "diagnostics-otel", "clawhub:@openclaw/diagnostics-otel"
     if mode == "langfuse-bridge":
-        return "langfuse-bridge", config.get("bridgeInstallPackage", "clawhub:openclaw-x-langfuse-plugin")
+        return "langfuse-bridge", "clawhub:openclaw-x-langfuse-plugin"
     raise ValueError("Unknown telemetry mode.")
 
 
@@ -270,12 +255,7 @@ def install_telemetry(config, home):
     # Use the plugin inventory for reruns; never blindly reinstall another copy.
     result = json.loads(command(["openclaw", "plugins", "list", "--json"], env=env))
     plugins = result if isinstance(result, list) else result.get("plugins", [])
-    if package == BRIDGE_SQLITE_PACKAGE:
-        # Supply the requested confirmation on stdin rather than a shell pipe.
-        # Force replacement even if the inventory contains an older bridge.
-        command(["openclaw", "plugins", "install", package, "--force"],
-                env=env, timeout=240, input_data="y\n")
-    elif not any(entry.get("id") == plugin for entry in plugins):
+    if not any(entry.get("id") == plugin for entry in plugins):
         command(["openclaw", "plugins", "install", package], env=env, timeout=240)
     result = json.loads(command(["openclaw", "plugins", "list", "--json"], env=env))
     plugins = result if isinstance(result, list) else result.get("plugins", [])
@@ -288,7 +268,6 @@ def install_telemetry(config, home):
 def main():
     os.umask(0o077)
     config = json.loads((SIDECAR / "bootstrap.json").read_text())
-    config = runtime_telemetry_config(config, command(["openclaw", "--version"]).strip())
     home = Path(config["home"])
     root = home / "sentinel-sidecar"
     root.chmod(0o700)
