@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Provisioner-owned bootstrap, run directly from ~/sentinel-sidecar."""
+import base64
 import fcntl
 import json
 import os
@@ -38,6 +39,11 @@ def environment(path):
 
 
 def install(config, desired, home, root):
+    desired = dict(desired)
+    if config.get("telemetry") == "otel":
+        desired["LANGFUSE_OTLP_AUTH"] = base64.b64encode(
+            (desired["LANGFUSE_PUBLIC_KEY"] + ":" + desired["LANGFUSE_SECRET_KEY"]).encode()
+        ).decode("ascii")
     env_path = home / ".openclaw/.env"
     print("[sentinel-bootstrap] Merging required values into OpenClaw's environment file", flush=True)
     env_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -51,7 +57,7 @@ def install(config, desired, home, root):
     missing = {key: value for key, value in desired.items()
                if key not in existing or (key in owned_settings and existing[key] != value)}
     # Persist these values even when Hyper already injects them into the process.
-    for key in ("OPENCLAW_GATEWAY_TOKEN", "OPENCLAW_CONTROL_UI_ALLOWED_ORIGIN"):
+    for key in ("OPENCLAW_GATEWAY_TOKEN", "OPENCLAW_CONTROL_UI_ALLOWED_ORIGIN", "LANGFUSE_OTLP_AUTH"):
         if desired.get(key) and not re.search(r"(?m)^\s*(?:export\s+)?" + key + r"\s*=", original):
             missing[key] = desired[key]
     if missing:
@@ -81,15 +87,16 @@ def install(config, desired, home, root):
 
 
 def verify(config, home, root):
-    print("[sentinel-bootstrap] Checking permissions and Langfuse bridge", flush=True)
+    plugin = telemetry_plugin(config)[0]
+    print("[sentinel-bootstrap] Checking permissions and " + plugin, flush=True)
     env_path = home / ".openclaw/.env"
     if env_path.stat().st_mode & 0o077 or root.stat().st_mode & 0o077:
         raise RuntimeError("Runtime secrets/directory permissions are too broad.")
     env = environment(env_path)
     inventory = json.loads(command(["openclaw", "plugins", "list", "--json"], env=env))
     plugins = inventory if isinstance(inventory, list) else inventory.get("plugins", [])
-    if not any(plugin.get("id") == "langfuse-bridge" and plugin.get("status") == "loaded" for plugin in plugins):
-        raise RuntimeError("Langfuse bridge did not load after gateway configuration; telemetry setup failed.")
+    if not any(entry.get("id") == plugin and entry.get("status") == "loaded" for entry in plugins):
+        raise RuntimeError(plugin + " did not load after gateway configuration; telemetry setup failed.")
     # Verify the model after the gateway patch, and establish the existing
     # session required by the current evaluator without modifying main chat.
     print("[sentinel-bootstrap] Checking model connectivity", flush=True)
@@ -142,20 +149,30 @@ def verify(config, home, root):
     print("Sentinel installation, evaluation dry runs, and automations verified.")
 
 
+def telemetry_plugin(config):
+    mode = config.get("telemetry", "langfuse-bridge")
+    if mode == "otel":
+        return "diagnostics-otel", "clawhub:@openclaw/diagnostics-otel"
+    if mode == "langfuse-bridge":
+        return "langfuse-bridge", "clawhub:openclaw-x-langfuse-plugin"
+    raise ValueError("Unknown telemetry mode.")
+
+
 def install_telemetry(config, home):
-    if config["telemetry"] != "langfuse-bridge":
-        raise RuntimeError("OTEL installation is unavailable; telemetry setup aborted.")
+    plugin, package = telemetry_plugin(config)
     env = environment(home / ".openclaw/.env")
-    print("[sentinel-bootstrap] Checking Langfuse bridge plugin installation", flush=True)
+    print("[sentinel-bootstrap] Checking plugin installation: " + plugin, flush=True)
     # Use the plugin inventory for reruns; never blindly reinstall another copy.
     result = json.loads(command(["openclaw", "plugins", "list", "--json"], env=env))
     plugins = result if isinstance(result, list) else result.get("plugins", [])
-    if not any(plugin.get("id") == "langfuse-bridge" for plugin in plugins):
-        command(["openclaw", "plugins", "install", "clawhub:openclaw-x-langfuse-plugin"], env=env, timeout=240)
+    if not any(entry.get("id") == plugin for entry in plugins):
+        command(["openclaw", "plugins", "install", package], env=env, timeout=240)
     result = json.loads(command(["openclaw", "plugins", "list", "--json"], env=env))
     plugins = result if isinstance(result, list) else result.get("plugins", [])
-    if not any(plugin.get("id") == "langfuse-bridge" for plugin in plugins):
-        raise RuntimeError("Langfuse bridge was not found after installation.")
+    if not any(entry.get("id") == plugin for entry in plugins):
+        raise RuntimeError(plugin + " was not found after installation.")
+    if config.get("telemetry") == "otel":
+        command(["openclaw", "plugins", "enable", plugin], env=env)
 
 
 def main():
